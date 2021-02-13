@@ -66,13 +66,6 @@ class RIGCTLD(object):
     def connect(self):
         """ Connect to rigctld instance """
         self.sock.connect((self.hostname,self.port))
-        model = self.get_model()
-        if model == None:
-            # Timeout!
-            self.close()
-            raise Exception("Timeout!")
-        else:
-            return model
 
 
     def close(self):
