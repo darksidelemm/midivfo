@@ -29,8 +29,12 @@ import math
 import socket
 import sys
 import time
+from queue import Queue
+from threading import Thread
 
 from rtmidi.midiutil import open_midiinput
+
+from civ import CIV
 
 # Read command-line arguments
 parser = argparse.ArgumentParser(description="MIDI to VFO", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -42,7 +46,7 @@ args = parser.parse_args()
 CW_TONE = args.cw
 # Assuming that if we tune above the CW tone that there will be no signal.
 # Might not be the case, but that just makes things interesting :-)
-OFF_TONE = CW_TONE + 300
+OFF_TONE = CW_TONE + 600
 
 class RIGCTLD(object):
     """ rigctld (hamlib) communication class """
@@ -84,21 +88,116 @@ class RIGCTLD(object):
             return None
 
 
-    def set_vfo(self, freq):
+    def set_freq(self, freq):
         """ Set the main VFO Frequency in Hz """
         _freq_hz = int(freq)
         self.send_command(f"F {_freq_hz}")
 
 
-# Connect to Rig and set to initial 'off' frequency.
-rig = RIGCTLD()
-rig.set_vfo(OFF_TONE)
+class ToneHandler(object):
+    """ Polyphony handler """
+    def __init__(
+        self,
+        cw_freq = [14067000],
+        tone_callbacks = []
+    ):
+        self.cw_freq = cw_freq
+        self.off_tone = 600
+        self.tone_callbacks = tone_callbacks
+        self.num_tones = len(self.tone_callbacks)
 
+        self.current_tones = [0] * self.num_tones
+
+        self.last_set = 0
+
+        self.input_queue = Queue()
+
+        self.processing_running = True
+
+        self.processing_thread = Thread(target=self.process_queue)
+        self.processing_thread.start()
+    
+
+    def close(self):
+        self.processing_running = False
+
+    def add_event(self, event, value):
+        self.input_queue.put([event, value])
+
+    def process_queue(self):
+
+        print("Input Processing Running")
+
+        while self.processing_running:
+            if self.input_queue.qsize() > 0:
+                _data = self.input_queue.get()
+
+                _event = _data[0]
+                _value = _data[1]
+
+                if _event == 'START':
+                    self.start_tone(_value)
+                elif _event == 'STOP':
+                    self.stop_tone(_value)
+
+        print("Input Processing Stopped")
+        
+
+    def set_single(self, index, frequency):
+        _freq = self.cw_freq[index] - frequency
+
+        self.tone_callbacks[index](_freq)
+
+    def start_tone(self, frequency):
+        
+        if frequency in self.current_tones:
+            return
+        else:
+            try:
+                ind = self.current_tones.index(0)
+                self.current_tones[ind] = frequency
+                self.set_single(ind,frequency)
+                self.last_set = ind
+            except:
+                # Can't find a free slot, so, go to the oldest used and set that.
+                ind = (self.last_set+1)%self.num_tones
+                self.current_tones[ind] = frequency
+                self.set_single(ind,frequency)
+                self.last_set = ind
+
+        print(self.current_tones)
+
+    def stop_tone(self, frequency):
+        if frequency in self.current_tones:
+            ind = self.current_tones.index(frequency)
+            self.current_tones[ind] = 0
+            self.set_single(ind, -600)
+
+        print(self.current_tones)
+
+
+# Connect to HF Rig (IC-7610) and set to initial 'off' frequency.
+hf_rig = CIV()
+HF_TONE = CW_TONE
+hf_rig.set_a(OFF_TONE)
+hf_rig.set_b(OFF_TONE)
+
+# Connect to UHF Rig (IC-9700) and do the same
+uhf_rig = CIV(addr=0xA2, port='/dev/tty.SLAB_USBtoUART89')
+UHF_TONE = 439399899
+
+# Tone handler setup for just HF rig.
+#tone_handler = ToneHandler(cw_freq=[HF_TONE,HF_TONE], tone_callbacks = [rig.set_a, rig.set_b])
+# Tone handler setup for just UHF rig (mono)
+#tone_handler = ToneHandler(cw_freq=[UHF_TONE], tone_callbacks = [uhf_rig.set_a])
+
+# Two-Rig Setup!
+tone_handler = ToneHandler(cw_freq=[HF_TONE,HF_TONE, UHF_TONE], tone_callbacks = [hf_rig.set_a, hf_rig.set_b, uhf_rig.set_a])
 
 
 def midi_callback(event, data=None):
     """ MIDI Event Callback """
-    global rig, CW_TONE, OFF_TONE
+    global tone_handler
 
     # Extract Midi Event Info
     _msg = event[0]
@@ -114,7 +213,7 @@ def midi_callback(event, data=None):
     elif _action == 0x9:
         _action = 'NOTE ON'
     else:
-        _action = 'UNKNOWN'
+        _action = f'UNKNOWN: {_action}'
 
     # Calculate Tone frequency
     _freq = int(math.pow(2.0,(_note-69.0)/12.0)*440)
@@ -122,11 +221,14 @@ def midi_callback(event, data=None):
     # Set VFO frequency so beat ends up at the desired frequency,
     # or set to the 'off' frequency.
     if _action == 'NOTE ON':
-        rig.set_vfo(CW_TONE-_freq)
+        if _velocity > 0:
+            tone_handler.add_event('START',_freq)
+        else:
+            tone_handler.add_event('STOP',_freq)
     elif _action == 'NOTE OFF':
-        rig.set_vfo(OFF_TONE)
+        tone_handler.add_event('STOP',_freq)
 
-    print(f"{_action}: {_freq}")
+    print(f"{_action}: {_freq} {_velocity}")
 
 try:
     midiin, port_name = open_midiinput(args.midi)
